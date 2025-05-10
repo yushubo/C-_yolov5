@@ -1,4 +1,4 @@
-# C-_yolov5
+# C++_yolov5
 使用C++去推理yolov5
 
 # 项目下载网址
