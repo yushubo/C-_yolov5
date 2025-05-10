@@ -3,6 +3,8 @@
 #include <opencv2/dnn/dnn.hpp>
 #include <string>
 #include <vector>
+#include <fstream>
+#include <sstream>
 
 using cv::Mat;
 using std::cout;
@@ -16,9 +18,28 @@ using std::vector;
 // 筛除重复度过高的框策略1：拿到置信度最高的框，把剩下的去掉
 // 筛除重复度过高的框策略2：拿到置信度最高的框，看剩下的框是否重复，重复过多就删除，也就是所谓的nms
 
-static const vector<string> class_name = {"cat", "chicken", "cow", "dog", "fox", "goat", "horse", "person", "racoon", "skunk"};
+// 配置参数结构体
+struct Config {
+    float conf_threshold = 0.7;    // 置信度阈值
+    float nms_threshold = 0.4;     // NMS阈值
+    int input_width = 640;         // 输入图像宽度
+    int input_height = 640;        // 输入图像高度
+    string model_path = "../best_lv.onnx";  // 模型路径
+    string image_path = "../1383.jpg";      // 测试图像路径
+};
 
-void print_result(const Mat &result, float conf = 0.7, int len_data = 15)
+// 类别名称
+static const vector<string> class_name = {"zhen_kong", "ca_shang", "zang_wu", "zhe_zhou"};
+
+// 错误处理函数
+void checkError(bool condition, const string& message) {
+    if (!condition) {
+        throw std::runtime_error(message);
+    }
+}
+
+// 打印检测结果  , 用于调试查看yolo输出
+void print_result(const Mat &result, float conf = 0.7, int len_data = 9)
 {
     float *pdata = (float *)result.data;
     for (int i = 0; i < result.total() / len_data; i++)
@@ -36,7 +57,8 @@ void print_result(const Mat &result, float conf = 0.7, int len_data = 15)
     return;
 }
 
-vector<vector<float>> get_info(const Mat &result, float conf = 0.7, int len_data = 15)
+// 筛选出置信度高于指定阈值（conf）的检测结果
+vector<vector<float>> get_info(const Mat &result, float conf = 0.7, int len_data = 9)
 {
     float *pdata = (float *)result.data;
     vector<vector<float>> info;
@@ -58,12 +80,14 @@ vector<vector<float>> get_info(const Mat &result, float conf = 0.7, int len_data
     return info;
 }
 
+// 坐标转换，变成左上角和右下角坐标
 void info_simplify(vector<vector<float>> &info)
 {
     for (auto i = 0; i < info.size(); i++)
     {
+        // 从第 5 个元素开始 找最大值，让它成为第六个数
         info[i][5] = std::max_element(info[i].cbegin() + 5, info[i].cend()) - (info[i].cbegin() + 5);
-        info[i].resize(6);
+        info[i].resize(6);  //调整数组长度
         float x = info[i][0];
         float y = info[i][1];
         float w = info[i][2];
@@ -73,12 +97,24 @@ void info_simplify(vector<vector<float>> &info)
         info[i][2] = x + w / 2.0;
         info[i][3] = y + h / 2.0;
     }
+
+    // 调试查看输出，处理结果
+    cout << "Simplified Info:" << endl;
+    for (const auto &row : info)
+    {
+        for (const auto &val : row)
+        {
+            cout << val << " ";
+        }
+        cout << endl;
+    }
 }
 
+// 创建一个三维数组，每个二维数组存储了同一类别的检测结果。 用于将类别分组存放
 vector<vector<vector<float>>> split_info(vector<vector<float>> &info)
 {
-    vector<vector<vector<float>>> info_split;
-    vector<int> class_id;
+    vector<vector<vector<float>>> info_split;    // 用于存储分组后的检测结果 三维数组
+    vector<int> class_id;                       // 用于存储已经处理过的类别 ID
     for (auto i = 0; i < info.size(); i++)
     {
         if (std::find(class_id.begin(), class_id.end(), (int)info[i][5]) == class_id.end())
@@ -92,56 +128,43 @@ vector<vector<vector<float>>> split_info(vector<vector<float>> &info)
     return info_split;
 }
 
-void nms(vector<vector<float>> &info, float iou = 0.4)
-{
-    int counter = 0;
-    vector<vector<float>> return_info;
-    while (counter < info.size())
-    {
-        return_info.clear();
-        float x1 = 0;
-        float x2 = 0;
-        float y1 = 0;
-        float y2 = 0;
-        std::sort(info.begin(), info.end(), [](vector<float> p1, vector<float> p2)
-                  { return p1[4] > p2[4]; });
-        for (auto i = 0; i < info.size(); i++)
-        {
-            if (i < counter)
-            {
-                return_info.push_back(info[i]);
-                continue;
-            }
-            if (i == counter)
-            {
-                x1 = info[i][0];
-                y1 = info[i][1];
-                x2 = info[i][2];
-                y2 = info[i][3];
-                return_info.push_back(info[i]);
-                continue;
-            }
-            if (info[i][0] > x2 or info[i][2] < x1 or info[i][1] > y2 or info[i][3] < y1)
-            {
-                return_info.push_back(info[i]);
-            }
-            else
-            {
-                float over_x1 = std::max(x1, info[i][0]);
-                float over_y1 = std::max(y1, info[i][1]);
-                float over_x2 = std::min(x2, info[i][2]);
-                float over_y2 = std::min(y2, info[i][3]);
-                float s_over = (over_x2 - over_x1) * (over_y2 - over_y1);
-                float s_total = (x2 - x1) * (y2 - y1) + (info[i][0] - info[i][2]) * (info[i][1] - info[i][3]) - s_over;
-                if (s_over / s_total < iou)
-                {
-                    return_info.push_back(info[i]);
-                }
+// 优化后的NMS实现
+void nms(vector<vector<float>>& info, float iou_threshold = 0.4) {
+    if (info.empty()) return;
+    
+    // 按置信度排序
+    std::sort(info.begin(), info.end(), 
+        [](const vector<float>& a, const vector<float>& b) { return a[4] > b[4]; });
+    
+    vector<vector<float>> result;
+    vector<bool> suppressed(info.size(), false);
+    
+    for (size_t i = 0; i < info.size(); ++i) {
+        if (suppressed[i]) continue;
+        
+        result.push_back(info[i]);
+        
+        for (size_t j = i + 1; j < info.size(); ++j) {
+            if (suppressed[j]) continue;
+            
+            // 计算IoU
+            float x1 = std::max(info[i][0], info[j][0]);
+            float y1 = std::max(info[i][1], info[j][1]);
+            float x2 = std::min(info[i][2], info[j][2]);
+            float y2 = std::min(info[i][3], info[j][3]);
+            
+            float intersection = std::max(0.0f, x2 - x1) * std::max(0.0f, y2 - y1);
+            float area1 = (info[i][2] - info[i][0]) * (info[i][3] - info[i][1]);
+            float area2 = (info[j][2] - info[j][0]) * (info[j][3] - info[j][1]);
+            float iou = intersection / (area1 + area2 - intersection);
+            
+            if (iou > iou_threshold) {
+                suppressed[j] = true;
             }
         }
-        info = return_info;
-        counter += 1;
     }
+    
+    info = result;
 }
 
 void print_info(const vector<vector<float>> &info)
@@ -172,36 +195,49 @@ void draw_box(Mat &img, const vector<vector<float>> &info)
     }
 }
 
-int main()
-{
-    cv::dnn::Net net = cv::dnn::readNetFromONNX("best.onnx");
-    Mat img = cv::imread("fox.jpg");
-    cv::resize(img, img, cv::Size(640, 640));
-    Mat blob = cv::dnn::blobFromImage(img, 1.0 / 255.0, cv::Size(640, 640), cv::Scalar(), true);
-    net.setInput(blob);
-    vector<Mat> netoutput;
-    vector<string> out_name = {"output"};
-    net.forward(netoutput, out_name);
-    Mat result = netoutput[0];
-    // print_result(result);
-    vector<vector<float>> info = get_info(result);
-    info_simplify(info);
-    vector<vector<vector<float>>> info_split = split_info(info);
-    // cout << " split info" << endl;
-    // print_info(info_split[0]);
-    // cout << info.size() << " " << info[0].size() << endl;
-
-    for(auto i=0; i < info_split.size(); i++)
-    {
-        nms(info_split[i]);
-        draw_box(img, info_split[i]);
+int main() {
+    try {
+        Config config;
+        
+        // 加载模型
+        cv::dnn::Net net = cv::dnn::readNetFromONNX(config.model_path);
+        checkError(!net.empty(), "Failed to load model");
+        
+        // 读取图像
+        Mat img = cv::imread(config.image_path);
+        checkError(!img.empty(), "Failed to load image");
+        
+        // 图像预处理
+        cv::resize(img, img, cv::Size(config.input_width, config.input_height));
+        Mat blob = cv::dnn::blobFromImage(img, 1.0/255.0, cv::Size(config.input_width, config.input_height), 
+                                        cv::Scalar(), true, false);
+        
+        // 模型推理
+        net.setInput(blob);
+        vector<string> out_name = {"output0"};
+        vector<Mat> netoutput;
+        net.forward(netoutput, out_name);
+        
+        // 后处理
+        Mat result = netoutput[0];
+        vector<vector<float>> info = get_info(result, config.conf_threshold);
+        info_simplify(info);
+        vector<vector<vector<float>>> info_split = split_info(info);
+        
+        // 对每个类别进行NMS和绘制
+        for (size_t i = 0; i < info_split.size(); i++) {
+            nms(info_split[i], config.nms_threshold);
+            draw_box(img, info_split[i]);
+        }
+        
+        // 显示结果
+        cv::imshow("Detection Result", img);
+        cv::waitKey(0);
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return -1;
     }
-
-    // nms(info_split[0]);
-    // cout << "nms" << endl;
-    // print_info(info_split[0]);
-    // draw_box(img, info_split[0]);
-    cv::imshow("test", img);
-    cv::waitKey(0);
+    
     return 0;
 }
